@@ -511,11 +511,6 @@ class RTCRtpReceiver:
                 self.__remote_streams[packet.ssrc].jitter_ms
             )
 
-            # Map time 0 to session start
-            encoded_frame.timestamp = int(
-                self.__session_tm_mapper.map(encoded_frame.timestamp/codec.clockRate)*codec.clockRate
-            )
-
             self.__decoder_queue.put((codec, encoded_frame))
 
     async def _run_rtcp(self) -> None:
