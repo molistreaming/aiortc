@@ -198,13 +198,13 @@ class TimestampMapper:
         self._last: Optional[int] = None
         self._origin: Optional[int] = None
 
-    def map(self, timestamp: Union[int, float], arrival_time_s: float = 0, jitter_ms: int = 0) -> int:
+    def map(self, timestamp: int, arrival_time_s: float = 0, jitter_ms: int = 0) -> int:
         if self._origin is None:
             # first timestamp
             self._origin = timestamp, int((arrival_time_s-jitter_ms/1000.0)*self._clock_rate)
         elif timestamp < self._last:
             # RTP timestamp wrapped
-            self._origin -= self._origin[0] - (1 << 32), self._origin[1]
+            self._origin = timestamp, int((arrival_time_s-jitter_ms/1000.0)*self._clock_rate)
 
         self._last = timestamp
         return timestamp - self._origin[0] + self._origin[1]
