@@ -204,7 +204,7 @@ class TimestampMapper:
             self._origin = timestamp, int((arrival_time_s-jitter_ms/1000.0)*self._clock_rate)
         elif timestamp < self._last:
             # RTP timestamp wrapped
-            self._origin[0] -= 1 << 32
+            self._origin -= self._origin[0] - (1 << 32), self._origin[1]
 
         self._last = timestamp
         return timestamp - self._origin[0] + self._origin[1]
