@@ -27,3 +27,6 @@ def datetime_to_ntp(dt: datetime.datetime) -> int:
     high = int(delta.total_seconds())
     low = round((delta.microseconds * (1 << 32)) // 1000000)
     return (high << 32) | low
+
+def ms_to_dt(tm_ms: int) -> datetime.datetime:
+    return NTP_EPOCH+datetime.timedelta(seconds=tm_ms/1000)

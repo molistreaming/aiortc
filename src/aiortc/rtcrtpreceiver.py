@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 
 from av.frame import Frame
 
@@ -158,6 +158,10 @@ class StreamStatistics:
         return self._jitter_q4 >> 4
 
     @property
+    def jitter_ms(self) -> int:
+        return int((self._jitter_q4 >> 4)*1000.0/self._clockrate)
+
+    @property
     def packets_expected(self) -> int:
         return self.cycles + self.max_seq - self.base_seq + 1
 
@@ -189,20 +193,21 @@ class RemoteStreamTrack(MediaStreamTrack):
 
 
 class TimestampMapper:
-    def __init__(self) -> None:
+    def __init__(self, clock_rate: int):
+        self._clock_rate = clock_rate
         self._last: Optional[int] = None
         self._origin: Optional[int] = None
 
-    def map(self, timestamp: int) -> int:
+    def map(self, timestamp: Union[int, float], arrival_time_s: float = 0, jitter_ms: int = 0) -> int:
         if self._origin is None:
             # first timestamp
-            self._origin = timestamp
+            self._origin = timestamp, int((arrival_time_s-jitter_ms/1000.0)*self._clock_rate)
         elif timestamp < self._last:
             # RTP timestamp wrapped
-            self._origin -= 1 << 32
+            self._origin[0] -= 1 << 32
 
         self._last = timestamp
-        return timestamp - self._origin
+        return timestamp - self._origin[0] + self._origin[1]
 
 
 @dataclass
@@ -263,12 +268,14 @@ class RTCRtpReceiver:
         self.__rtx_ssrc: Dict[int, int] = {}
         self.__started = False
         self.__stats = RTCStatsReport()
-        self.__timestamp_mapper = TimestampMapper()
+        self.__session_tm_mapper = TimestampMapper(0)
+        self.__timestamp_mapper: Dict[int, TimestampMapper] = {}
         self.__transport = transport
 
         # RTCP
         self.__lsr: Dict[int, int] = {}
         self.__lsr_time: Dict[int, float] = {}
+
         self.__remote_streams: Dict[int, StreamStatistics] = {}
         self.__rtcp_ssrc: Optional[int] = None
 
@@ -494,9 +501,21 @@ class RTCRtpReceiver:
 
         # if we have a complete encoded frame, decode it
         if encoded_frame is not None and self.__decoder_thread:
-            encoded_frame.timestamp = self.__timestamp_mapper.map(
-                encoded_frame.timestamp
+            if packet.ssrc not in self.__timestamp_mapper:
+                self.__timestamp_mapper[packet.ssrc] = TimestampMapper(codec.clockRate)
+
+            # Re-map timestamp to local time
+            encoded_frame.timestamp = self.__timestamp_mapper[packet.ssrc].map(
+                encoded_frame.timestamp,
+                clock.ms_to_dt(arrival_time_ms).timestamp(),
+                self.__remote_streams[packet.ssrc].jitter_ms
             )
+
+            # Map time 0 to session start
+            encoded_frame.timestamp = int(
+                self.__session_tm_mapper.map(encoded_frame.timestamp/codec.clockRate)*codec.clockRate
+            )
+
             self.__decoder_queue.put((codec, encoded_frame))
 
     async def _run_rtcp(self) -> None:
