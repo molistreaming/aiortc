@@ -268,7 +268,6 @@ class RTCRtpReceiver:
         self.__rtx_ssrc: Dict[int, int] = {}
         self.__started = False
         self.__stats = RTCStatsReport()
-        self.__session_tm_mapper = TimestampMapper(0)
         self.__timestamp_mapper: Dict[int, TimestampMapper] = {}
         self.__transport = transport
 
