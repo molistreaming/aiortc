@@ -6,7 +6,8 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Union
+from collections import defaultdict, deque
+from typing import Dict, List, Optional, Set, Deque
 
 from av.frame import Frame
 
@@ -210,6 +211,55 @@ class TimestampMapper:
         return timestamp - self._origin[0] + self._origin[1]
 
 
+@dataclass(frozen=True)
+class RTPToArrivalTime:
+    rtp_timestamp: int
+    arrival_tm_ms: int
+
+
+class LatencyEstimator:
+    def __init__(self, clock_rate: int, min_estimation_time_ms: int = 1500):
+        self._latency_agg: int = 0
+        self._clock_rate: int = clock_rate
+        self._first_arrival_time_ms: int = None
+        self._min_estimation_time_ms: int = min_estimation_time_ms
+        self._packets: Deque[RTPToArrivalTime] = deque(maxlen=2)
+        self._packet_latencies: Deque[int] = deque(maxlen=10000)
+
+    def add(self, rtp_timestamp: int, arrival_tm_ms: int) -> None:
+        if self._first_arrival_time_ms is None:
+            self._first_arrival_time_ms = arrival_tm_ms
+
+        self._packets.append(
+            RTPToArrivalTime(
+                rtp_timestamp=rtp_timestamp,
+                arrival_tm_ms=arrival_tm_ms
+            )
+        )
+        if len(self._packets) < 2:
+            return
+
+        a, b = self._packets[-2], self._packets[-1]
+        darr = b.arrival_tm_ms-a.arrival_tm_ms
+        drtp = int(round((b.rtp_timestamp - a.rtp_timestamp) * 1000 / self._clock_rate))
+        latency_ms = abs(darr-drtp)
+
+        T = self._min_estimation_time_ms
+        if self._packets[0].arrival_tm_ms-self._first_arrival_time_ms >= T:
+            self._latency_agg -= self._packet_latencies.popleft()
+
+        self._latency_agg += latency_ms
+        self._packet_latencies.append(latency_ms)
+
+    @property
+    def latency_ms(self) -> Optional[int]:
+        T = self._min_estimation_time_ms
+        if len(self._packets) == 0 or self._packets[0].arrival_tm_ms-self._first_arrival_time_ms < T:
+            return None
+
+        N = len(self._packet_latencies)
+        return (self._latency_agg+N//2)//N
+
 @dataclass
 class RTCRtpContributingSource:
     """
@@ -269,6 +319,7 @@ class RTCRtpReceiver:
         self.__started = False
         self.__stats = RTCStatsReport()
         self.__timestamp_mapper: Dict[int, TimestampMapper] = {}
+        self.__stream_latency: Dict[int, LatencyEstimator] = {}
         self.__transport = transport
 
         # RTCP
@@ -461,6 +512,12 @@ class RTCRtpReceiver:
             self.__remote_streams[packet.ssrc] = StreamStatistics(codec.clockRate)
         self.__remote_streams[packet.ssrc].add(packet)
 
+        # feed latency estimators
+        if packet.ssrc not in self.__stream_latency:
+            self.__stream_latency[packet.ssrc] = LatencyEstimator(codec.clockRate, 1500)
+        self.__stream_latency[packet.ssrc].add(packet.timestamp, arrival_time_ms)
+
+
         # unwrap retransmission packet
         if is_rtx(codec):
             original_ssrc = self.__rtx_ssrc.get(packet.ssrc)
@@ -504,13 +561,20 @@ class RTCRtpReceiver:
                 self.__timestamp_mapper[packet.ssrc] = TimestampMapper(codec.clockRate)
 
             # Re-map timestamp to local time
-            encoded_frame.timestamp = self.__timestamp_mapper[packet.ssrc].map(
-                encoded_frame.timestamp,
-                clock.ms_to_dt(arrival_time_ms).timestamp(),
-                self.__remote_streams[packet.ssrc].jitter_ms
-            )
+            if self.__stream_latency[packet.ssrc].latency_ms is not None:
+                encoded_frame.timestamp = self.__timestamp_mapper[packet.ssrc].map(
+                    encoded_frame.timestamp,
+                    clock.ms_to_dt(arrival_time_ms).timestamp(),
+                    self.__stream_latency[packet.ssrc].latency_ms
+                )
+                self.__log_debug(
+                    'STREAM [%d] - LATENCY: %d ms, TS: %d ms',
+                    packet.ssrc,
+                    self.__stream_latency[packet.ssrc].latency_ms,
+                    encoded_frame.timestamp * 1000 // codec.clockRate
+                )
 
-            self.__decoder_queue.put((codec, encoded_frame))
+                self.__decoder_queue.put((codec, encoded_frame))
 
     async def _run_rtcp(self) -> None:
         self.__log_debug("- RTCP started")
