@@ -6,10 +6,12 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
+import av.frame
 from av.frame import Frame
 
+import aiortc.codecs
 from . import clock
 from .codecs import depayload, get_capabilities, get_decoder, is_rtx, Decoder
 from .exceptions import InvalidStateError
@@ -47,7 +49,15 @@ from .utils import uint16_add, uint16_gt
 
 logger = logging.getLogger(__name__)
 
-DecodedFrameT = Frame
+
+@dataclass(frozen=True)
+class EncodedFrame:
+    frame: JitterFrame
+    decoder: aiortc.codecs.Decoder
+    codec_params: aiortc.codecs.RTCRtpCodecParameters
+
+
+DecodedFrameT = Union[av.frame.Frame, EncodedFrame]
 EncodedFrameT = Tuple[RTCRtpCodecParameters, JitterFrame]
 EncodedQT = "queue.Queue[Optional[EncodedFrameT]]"
 DecodedQT = "asyncio.Queue[Optional[DecodedFrameT]]"
@@ -74,7 +84,12 @@ def decoder_worker(
             codec_name = codec.name
 
         encoded_frame.decoder = decoder
-        asyncio.run_coroutine_threadsafe(output_q.put(encoded_frame), loop)
+        frame = EncodedFrame(
+            frame=encoded_frame,
+            decoder=decoder,
+            codec_params=codec
+        )
+        asyncio.run_coroutine_threadsafe(output_q.put(frame), loop)
         #frames = decoder.decode(encoded_frame)
         #for frame in frames:
             # pass the decoded frame to the track
