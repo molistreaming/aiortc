@@ -220,16 +220,16 @@ class TimestampMapper:
         self._last: Optional[int] = None
         self._origin: Optional[int] = None
 
-    def map(self, timestamp: int) -> int:
+    def map(self, timestamp: int, arrival_tm: int) -> int:
         if self._origin is None:
             # first timestamp
-            self._origin = timestamp
+            self._origin = timestamp, arrival_tm
         elif timestamp < self._last:
             # RTP timestamp wrapped
-            self._origin -= 1 << 32
+            self._origin = self._origin[0]-(1<<32), arrival_tm
 
         self._last = timestamp
-        return timestamp - self._origin
+        return timestamp - self._origin[0]+self._origin[1]
 
 
 @dataclass
@@ -522,7 +522,8 @@ class RTCRtpReceiver:
         # if we have a complete encoded frame, decode it
         if encoded_frame is not None and self.__decoder_thread:
             encoded_frame.timestamp = self.__timestamp_mapper.map(
-                encoded_frame.timestamp
+                encoded_frame.timestamp,
+                int(time.time()*codec.clockRate)
             )
             self.__decoder_queue.put((codec, encoded_frame))
 
