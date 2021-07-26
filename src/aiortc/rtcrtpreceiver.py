@@ -6,14 +6,14 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from av.frame import Frame
 
 from . import clock
-from .codecs import depayload, get_capabilities, get_decoder, is_rtx
+from .codecs import depayload, get_capabilities, get_decoder, is_rtx, Decoder
 from .exceptions import InvalidStateError
-from .jitterbuffer import JitterBuffer
+from .jitterbuffer import JitterBuffer, JitterFrame
 from .mediastreams import MediaStreamError, MediaStreamTrack
 from .rate import RemoteBitrateEstimator
 from .rtcdtlstransport import RTCDtlsTransport
@@ -47,10 +47,19 @@ from .utils import uint16_add, uint16_gt
 
 logger = logging.getLogger(__name__)
 
+DecodedFrameT = Frame
+EncodedFrameT = Tuple[RTCRtpCodecParameters, JitterFrame]
+EncodedQT = "queue.Queue[Optional[EncodedFrameT]]"
+DecodedQT = "asyncio.Queue[Optional[DecodedFrameT]]"
 
-def decoder_worker(loop, input_q, output_q):
-    codec_name = None
-    decoder = None
+
+def decoder_worker(
+        loop: asyncio.AbstractEventLoop,
+        input_q: EncodedQT,
+        output_q: DecodedQT,
+):
+    codec_name: Optional[str] = None
+    decoder: Optional[Decoder] = None
 
     while True:
         task = input_q.get()
@@ -64,9 +73,12 @@ def decoder_worker(loop, input_q, output_q):
             decoder = get_decoder(codec)
             codec_name = codec.name
 
-        for frame in decoder.decode(encoded_frame):
+        encoded_frame.decoder = decoder
+        asyncio.run_coroutine_threadsafe(output_q.put(encoded_frame), loop)
+        #frames = decoder.decode(encoded_frame)
+        #for frame in frames:
             # pass the decoded frame to the track
-            asyncio.run_coroutine_threadsafe(output_q.put(frame), loop)
+        #    asyncio.run_coroutine_threadsafe(output_q.put(frame), loop)
 
     if decoder is not None:
         del decoder
@@ -172,7 +184,7 @@ class RemoteStreamTrack(MediaStreamTrack):
         self.kind = kind
         if id is not None:
             self._id = id
-        self._queue: asyncio.Queue = asyncio.Queue()
+        self._queue: DecodedQT = asyncio.Queue()
 
     async def recv(self) -> Frame:
         """
@@ -246,7 +258,7 @@ class RTCRtpReceiver:
 
         self.__active_ssrc: Dict[int, datetime.datetime] = {}
         self.__codecs: Dict[int, RTCRtpCodecParameters] = {}
-        self.__decoder_queue: queue.Queue = queue.Queue()
+        self.__decoder_queue: EncodedQT = queue.Queue()
         self.__decoder_thread: Optional[threading.Thread] = None
         self.__kind = kind
         if kind == "audio":
