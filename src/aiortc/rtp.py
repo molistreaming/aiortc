@@ -592,19 +592,24 @@ class RtcpPacket:
                 if not payload or not payload[-1] or payload[-1] > len(payload):
                     raise ValueError("RTCP packet padding length is invalid")
                 payload = payload[0 : -payload[-1]]
-
-            if packet_type == RTCP_BYE:
-                packets.append(RtcpByePacket.parse(payload, count))
-            elif packet_type == RTCP_SDES:
-                packets.append(RtcpSdesPacket.parse(payload, count))
-            elif packet_type == RTCP_SR:
-                packets.append(RtcpSrPacket.parse(payload, count))
-            elif packet_type == RTCP_RR:
-                packets.append(RtcpRrPacket.parse(payload, count))
-            elif packet_type == RTCP_RTPFB:
-                packets.append(RtcpRtpfbPacket.parse(payload, count))
-            elif packet_type == RTCP_PSFB:
-                packets.append(RtcpPsfbPacket.parse(payload, count))
+            try:
+                if packet_type == RTCP_BYE:
+                    packets.append(RtcpByePacket.parse(payload, count))
+                elif packet_type == RTCP_SDES:
+                    packets.append(RtcpSdesPacket.parse(payload, count))
+                elif packet_type == RTCP_SR:
+                    packets.append(RtcpSrPacket.parse(payload, count))
+                elif packet_type == RTCP_RR:
+                    packets.append(RtcpRrPacket.parse(payload, count))
+                elif packet_type == RTCP_RTPFB:
+                    packets.append(RtcpRtpfbPacket.parse(payload, count))
+                elif packet_type == RTCP_PSFB:
+                    packets.append(RtcpPsfbPacket.parse(payload, count))
+            except ValueError as ex:
+                print(ex)
+            except Exception as ex:
+                print(ex)
+                return []
 
         return packets
 

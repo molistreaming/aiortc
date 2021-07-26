@@ -5,14 +5,14 @@ import queue
 import random
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from collections import defaultdict, deque
-from typing import Dict, List, Optional, Set, Deque
+from typing import Dict, List, Optional, Set, Tuple, Deque
 
 from av.frame import Frame
 
 from . import clock
-from .codecs import depayload, get_capabilities, get_decoder, is_rtx
+from .codecs import depayload, get_capabilities, get_decoder, is_rtx, Decoder
 from .exceptions import InvalidStateError
 from .jitterbuffer import JitterBuffer
 from .mediastreams import MediaStreamError, MediaStreamTrack
@@ -48,10 +48,9 @@ from .utils import uint16_add, uint16_gt
 
 logger = logging.getLogger(__name__)
 
-
 def decoder_worker(loop, input_q, output_q):
-    codec_name = None
-    decoder = None
+    codec_name: Optional[str] = None
+    decoder: Optional[Decoder] = None
 
     while True:
         task = input_q.get()
@@ -66,6 +65,9 @@ def decoder_worker(loop, input_q, output_q):
             codec_name = codec.name
 
         for frame in decoder.decode(encoded_frame):
+            if frame.pts == 0:
+                continue
+
             # pass the decoded frame to the track
             asyncio.run_coroutine_threadsafe(output_q.put(frame), loop)
 
@@ -211,54 +213,50 @@ class TimestampMapper:
         return timestamp - self._origin[0] + self._origin[1]
 
 
-@dataclass(frozen=True)
-class RTPToArrivalTime:
-    rtp_timestamp: int
-    arrival_tm_ms: int
+class RTPRateEstimator:
+    def __init__(self):
+        self._samples: Deque[int] = deque(maxlen=100)
 
-
-class LatencyEstimator:
-    def __init__(self, clock_rate: int, min_estimation_time_ms: int = 1500):
-        self._latency_agg: int = 0
-        self._clock_rate: int = clock_rate
-        self._first_arrival_time_ms: int = None
-        self._min_estimation_time_ms: int = min_estimation_time_ms
-        self._packets: Deque[RTPToArrivalTime] = deque(maxlen=2)
-        self._packet_latencies: Deque[int] = deque(maxlen=10000)
-
-    def add(self, rtp_timestamp: int, arrival_tm_ms: int) -> None:
-        if self._first_arrival_time_ms is None:
-            self._first_arrival_time_ms = arrival_tm_ms
-
-        self._packets.append(
-            RTPToArrivalTime(
-                rtp_timestamp=rtp_timestamp,
-                arrival_tm_ms=arrival_tm_ms
-            )
-        )
-        if len(self._packets) < 2:
-            return
-
-        a, b = self._packets[-2], self._packets[-1]
-        darr = b.arrival_tm_ms-a.arrival_tm_ms
-        drtp = int(round((b.rtp_timestamp - a.rtp_timestamp) * 1000 / self._clock_rate))
-        latency_ms = abs(darr-drtp)
-
-        T = self._min_estimation_time_ms
-        if self._packets[0].arrival_tm_ms-self._first_arrival_time_ms >= T:
-            self._latency_agg -= self._packet_latencies.popleft()
-
-        self._latency_agg += latency_ms
-        self._packet_latencies.append(latency_ms)
+    def add(self, rtp_timestamp: int) -> None:
+        self._samples.append(rtp_timestamp)
 
     @property
-    def latency_ms(self) -> Optional[int]:
-        T = self._min_estimation_time_ms
-        if len(self._packets) == 0 or self._packets[0].arrival_tm_ms-self._first_arrival_time_ms < T:
+    def rate(self) -> Optional[int]:
+        values = self._samples
+        N = len(self._samples)
+        if N < 2:
             return None
 
-        N = len(self._packet_latencies)
-        return (self._latency_agg+N//2)//N
+        acc: int = 0
+        last_x, *values = values
+        for x in values:
+            acc += x-last_x
+            last_x = x
+
+        return (acc + N//2)//N
+
+
+class RTPToTimestampMapper:
+    def __init__(self, clock_rate: int):
+        self._clock_rate: int = clock_rate
+        self._params: Optional[Tuple[float, int]] = None
+        self._rate_estimator: RTPRateEstimator = RTPRateEstimator()
+
+    def update(self, rtp_timestamp: int, ntp_timestamp: int):
+        unix_tm = clock.datetime_from_ntp(ntp_timestamp).timestamp()
+        self._params = (1.0, int(unix_tm*self._clock_rate)-rtp_timestamp)
+
+    def map(self, rtp_timestamp: int) -> Optional[int]:
+        self._rate_estimator.add(rtp_timestamp)
+
+        if self._params is None:
+            return 0
+            now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+            print(now)
+            self.update(rtp_timestamp, clock.datetime_to_ntp(now))
+
+        return int(round(self._params[0]*rtp_timestamp))+self._params[1]
+
 
 @dataclass
 class RTCRtpContributingSource:
@@ -318,8 +316,7 @@ class RTCRtpReceiver:
         self.__rtx_ssrc: Dict[int, int] = {}
         self.__started = False
         self.__stats = RTCStatsReport()
-        self.__timestamp_mapper: Dict[int, TimestampMapper] = {}
-        self.__stream_latency: Dict[int, LatencyEstimator] = {}
+        self.__timestamp_mapper: Dict[int, RTPToTimestampMapper] = {}
         self.__transport = transport
 
         # RTCP
@@ -445,6 +442,7 @@ class RTCRtpReceiver:
         self.__log_debug("< %s", packet)
 
         if isinstance(packet, RtcpSrPacket):
+            print(f'SENDER REPORT [{packet.ssrc}]: ', packet, packet.sender_info, packet.reports)
             self.__stats.add(
                 RTCRemoteOutboundRtpStreamStats(
                     # RTCStats
@@ -468,6 +466,11 @@ class RTCRtpReceiver:
                 (packet.sender_info.ntp_timestamp) >> 16
             ) & 0xFFFFFFFF
             self.__lsr_time[packet.ssrc] = time.time()
+
+            self.__timestamp_mapper[packet.ssrc].update(
+                packet.sender_info.rtp_timestamp,
+                packet.sender_info.ntp_timestamp
+            )
         elif isinstance(packet, RtcpByePacket):
             self.__stop_decoder()
 
@@ -507,15 +510,13 @@ class RTCRtpReceiver:
             )
             return
 
+        if packet.ssrc not in self.__timestamp_mapper:
+            self.__timestamp_mapper[packet.ssrc] = RTPToTimestampMapper(codec.clockRate)
+
         # feed RTCP statistics
         if packet.ssrc not in self.__remote_streams:
             self.__remote_streams[packet.ssrc] = StreamStatistics(codec.clockRate)
         self.__remote_streams[packet.ssrc].add(packet)
-
-        # feed latency estimators
-        if packet.ssrc not in self.__stream_latency:
-            self.__stream_latency[packet.ssrc] = LatencyEstimator(codec.clockRate, 1500)
-        self.__stream_latency[packet.ssrc].add(packet.timestamp, arrival_time_ms)
 
 
         # unwrap retransmission packet
@@ -557,24 +558,10 @@ class RTCRtpReceiver:
 
         # if we have a complete encoded frame, decode it
         if encoded_frame is not None and self.__decoder_thread:
-            if packet.ssrc not in self.__timestamp_mapper:
-                self.__timestamp_mapper[packet.ssrc] = TimestampMapper(codec.clockRate)
-
-            # Re-map timestamp to local time
-            if self.__stream_latency[packet.ssrc].latency_ms is not None:
-                encoded_frame.timestamp = self.__timestamp_mapper[packet.ssrc].map(
-                    encoded_frame.timestamp,
-                    clock.ms_to_dt(arrival_time_ms).timestamp(),
-                    self.__stream_latency[packet.ssrc].latency_ms
-                )
-                self.__log_debug(
-                    'STREAM [%d] - LATENCY: %d ms, TS: %d ms',
-                    packet.ssrc,
-                    self.__stream_latency[packet.ssrc].latency_ms,
-                    encoded_frame.timestamp * 1000 // codec.clockRate
-                )
-
-                self.__decoder_queue.put((codec, encoded_frame))
+            encoded_frame.timestamp = self.__timestamp_mapper[packet.ssrc].map(
+                encoded_frame.timestamp
+            )
+            self.__decoder_queue.put((codec, encoded_frame))
 
     async def _run_rtcp(self) -> None:
         self.__log_debug("- RTCP started")
@@ -610,6 +597,7 @@ class RTCRtpReceiver:
 
                 if self.__rtcp_ssrc is not None and reports:
                     packet = RtcpRrPacket(ssrc=self.__rtcp_ssrc, reports=reports)
+                    #print(packet)
                     await self._send_rtcp(packet)
 
         except asyncio.CancelledError:
