@@ -83,7 +83,6 @@ def decoder_worker(
             decoder = get_decoder(codec)
             codec_name = codec.name
 
-        encoded_frame.decoder = decoder
         frame = EncodedFrame(
             frame=encoded_frame,
             decoder=decoder,
